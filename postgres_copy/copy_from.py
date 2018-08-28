@@ -91,6 +91,27 @@ class CopyMapping(object):
         # Configure the name of our temporary table to COPY into
         self.temp_table_name = "temp_%s" % self.model._meta.db_table
 
+        # Check if there is the need to COPY to a temp table first
+        self.skip_tt = self.skip_temp_table()
+
+    def skip_temp_table(self):
+        """
+        Checks whether there are template overrides in the objects model.
+        """
+        for field_name, header in self.mapping.items():
+            # Pull the field object from the model
+            field = self.get_field(field_name)
+
+            # Check for datatype template overrides
+            field_override = hasattr(field, 'copy_template')
+
+            # Check for field specific template overrides
+            template_method = 'copy_%s_template' % field.name
+            model_override = hasattr(self.model, template_method)
+
+            # Return True only if both conditions are False
+            return not(field_override or model_override)
+
     def save(self, silent=False, stream=sys.stdout):
         """
         Saves the contents of the CSV file to the database.
@@ -115,10 +136,15 @@ class CopyMapping(object):
 
         # Connect to the database
         with self.conn.cursor() as c:
-            self.create(c)
-            self.copy(c)
-            insert_count = self.insert(c)
-            self.drop(c)
+            # COPY directly to end table
+            if self.skip_tt:
+                insert_count = self.copy(c)
+            # COPY to temp table first then INSERT into end table
+            else:
+                self.create(c)
+                self.copy(c)
+                insert_count = self.insert(c)
+                self.drop(c)
 
         if not silent:
             stream.write("{} records loaded\n".format(intcomma(insert_count)))
@@ -238,8 +264,14 @@ class CopyMapping(object):
             FROM STDIN
             WITH CSV HEADER %(extra_options)s;
         """
+
+        if self.skip_tt:
+            db_table = self.model._meta.db_table
+        else:
+            db_table = self.temp_table_name
+
         options = {
-            'db_table': self.temp_table_name,
+            'db_table': db_table,
             'extra_options': '',
             'header_list': ", ".join([
                 '"{}"'.format(h) for h in self.headers
@@ -281,6 +313,8 @@ class CopyMapping(object):
         copy_sql = self.prep_copy()
         logger.debug(copy_sql)
         cursor.copy_expert(copy_sql, self.csv_file)
+        insert_count = cursor.rowcount
+        logger.debug("{} rows inserted".format(insert_count))
 
         # Run post-copy hook
         self.post_copy(cursor)
